@@ -993,6 +993,18 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             name=os.getenv("BLUEBUBBLES_HOME_CHANNEL_NAME", "Home"),
         )
 
+    # DingTalk
+    dingtalk_client_id = os.getenv("DINGTALK_CLIENT_ID")
+    dingtalk_client_secret = os.getenv("DINGTALK_CLIENT_SECRET")
+    if dingtalk_client_id and dingtalk_client_secret:
+        if Platform.DINGTALK not in config.platforms:
+            config.platforms[Platform.DINGTALK] = PlatformConfig()
+        config.platforms[Platform.DINGTALK].enabled = True
+        config.platforms[Platform.DINGTALK].extra.update({
+            "client_id": dingtalk_client_id,
+            "client_secret": dingtalk_client_secret,
+        })
+
     # Session settings
     idle_minutes = os.getenv("SESSION_IDLE_MINUTES")
     if idle_minutes:
