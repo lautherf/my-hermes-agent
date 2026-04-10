@@ -95,45 +95,66 @@ class DingTalkAdapter(BasePlatformAdapter):
 
     async def connect(self) -> bool:
         """Connect to DingTalk via Stream Mode."""
+        logger.info("[DingTalk] 🔌 Attempting to connect to DingTalk...")
+        
         if not DINGTALK_STREAM_AVAILABLE:
-            logger.warning("[%s] dingtalk-stream not installed. Run: pip install dingtalk-stream", self.name)
+            logger.error("[DingTalk] dingtalk-stream not installed. Run: pip install dingtalk-stream")
             return False
         if not HTTPX_AVAILABLE:
-            logger.warning("[%s] httpx not installed. Run: pip install httpx", self.name)
+            logger.error("[DingTalk] httpx not installed. Run: pip install httpx")
             return False
         if not self._client_id or not self._client_secret:
-            logger.warning("[%s] DINGTALK_CLIENT_ID and DINGTALK_CLIENT_SECRET required", self.name)
+            logger.error("[DingTalk] DINGTALK_CLIENT_ID and DINGTALK_CLIENT_SECRET required")
             return False
 
+        logger.info("[DingTalk] 🔑 Client ID available: %s", self._client_id[:8] + "...")
+        
         try:
+            logger.info("[DingTalk] 🌐 Creating HTTP client...")
             self._http_client = httpx.AsyncClient(timeout=30.0)
 
+            logger.info("[DingTalk] 🎫 Creating DingTalk credential...")
             credential = dingtalk_stream.Credential(self._client_id, self._client_secret)
+            
+            logger.info("[DingTalk] 📡 Creating stream client...")
             self._stream_client = dingtalk_stream.DingTalkStreamClient(credential)
 
             # Capture the current event loop for cross-thread dispatch
             loop = asyncio.get_running_loop()
+            logger.info("[DingTalk] 🔄 Creating message handler...")
             handler = _IncomingHandler(self, loop)
             self._stream_client.register_callback_handler(
                 dingtalk_stream.ChatbotMessage.TOPIC, handler
             )
 
+            logger.info("[DingTalk] 🚀 Starting stream task...")
             self._stream_task = asyncio.create_task(self._run_stream())
             self._mark_connected()
-            logger.info("[%s] Connected via Stream Mode", self.name)
+            logger.info("[DingTalk] ✅ Connected successfully via Stream Mode")
             return True
         except Exception as e:
-            logger.error("[%s] Failed to connect: %s", self.name, e)
+            logger.error("[DingTalk] ❌ Failed to connect: %s", e)
+            logger.exception("[DingTalk] Full connection error trace:")
             return False
 
     async def _run_stream(self) -> None:
         """Run the blocking stream client with auto-reconnection."""
         backoff_idx = 0
+        stream_task = None
         while self._running:
             try:
                 logger.debug("[%s] Starting stream client...", self.name)
-                await asyncio.to_thread(self._stream_client.start)
+                # start() runs forever in a loop, create task and don't await
+                # This allows us to cancel it when needed for reconnection
+                stream_task = asyncio.create_task(self._stream_client.start())
+                # Wait for the task to complete (will only complete on error or cancellation)
+                await stream_task
+                stream_task = None
+                # If we get here, the stream ended unexpectedly - fall through to reconnect
             except asyncio.CancelledError:
+                if stream_task:
+                    stream_task.cancel()
+                    stream_task = None
                 return
             except Exception as e:
                 if not self._running:
@@ -174,15 +195,50 @@ class DingTalkAdapter(BasePlatformAdapter):
 
     async def _on_message(self, message: "ChatbotMessage") -> None:
         """Process an incoming DingTalk chatbot message."""
+        import traceback
         msg_id = getattr(message, "message_id", None) or uuid.uuid4().hex
+        
+        logger.info("[DingTalk] 🔔 [_ON_MESSAGE START] Processing message ID: %s", msg_id)
+        
+        # Handle new CallbackMessage format with 'data' attribute
+        data = getattr(message, "data", None)
+        if data and isinstance(data, dict):
+            logger.info("[DingTalk] 🔔 Using new message format with data attribute")
+            # Extract from nested data structure
+            text = data.get("text", {})
+            if isinstance(text, dict):
+                message.text = text.get("content", "")
+            else:
+                message.text = str(text) if text else ""
+            
+            message.conversation_id = data.get("conversationId", "")
+            message.sender_id = data.get("senderId", "")
+            message.sender_nick = data.get("senderNick", "")
+            message.sender_staff_id = data.get("senderStaffId", "")
+            message.conversation_type = data.get("conversationType", "1")
+            message.session_webhook = data.get("sessionWebhook", "")
+            message.message_id = data.get("msgId", msg_id)
+            
+            # Handle createAt timestamp
+            create_at = data.get("createAt")
+            if create_at:
+                message.create_at = create_at
+                
+        logger.info("[DingTalk] 🔔 Message details: conversation_id=%s, sender_id=%s, text=%s", 
+                    getattr(message, "conversation_id", "?"),
+                    getattr(message, "sender_id", "?"),
+                    str(getattr(message, "text", "?"))[:50])
+        
         if self._is_duplicate(msg_id):
-            logger.debug("[%s] Duplicate message %s, skipping", self.name, msg_id)
+            logger.debug("[DingTalk] Duplicate message %s, skipping", msg_id)
             return
 
         text = self._extract_text(message)
         if not text:
-            logger.debug("[%s] Empty message, skipping", self.name)
+            logger.debug("[DingTalk] Empty message, skipping")
             return
+
+        logger.info("[DingTalk] 📝 Extracted text: %s", text[:100])
 
         # Chat context
         conversation_id = getattr(message, "conversation_id", "") or ""
@@ -195,10 +251,14 @@ class DingTalkAdapter(BasePlatformAdapter):
         chat_id = conversation_id or sender_id
         chat_type = "group" if is_group else "dm"
 
+        logger.info("[DingTalk] 👤 Sender: %s (ID: %s), Chat: %s (%s)", 
+                    sender_nick, sender_id, chat_id[:20] if chat_id else "?", chat_type)
+
         # Store session webhook for reply routing
         session_webhook = getattr(message, "session_webhook", None) or ""
         if session_webhook and chat_id:
             self._session_webhooks[chat_id] = session_webhook
+            logger.debug("[DingTalk] 📍 Stored session webhook for chat: %s", chat_id[:20])
 
         source = self.build_source(
             chat_id=chat_id,
@@ -225,13 +285,50 @@ class DingTalkAdapter(BasePlatformAdapter):
             timestamp=timestamp,
         )
 
-        logger.debug("[%s] Message from %s in %s: %s",
-                      self.name, sender_nick, chat_id[:20] if chat_id else "?", text[:50])
-        await self.handle_message(event)
+        logger.info("[DingTalk] 🚀 Starting message handling for event...")
+        try:
+            logger.info("[DingTalk] ⏳ About to call handle_message()...")
+            await self.handle_message(event)
+            logger.info("[DingTalk] ✅ Message handling completed successfully")
+        except Exception as e:
+            logger.error("[DingTalk] ❌ Error in message handling: %s", e)
+            logger.exception("[DingTalk] Full error trace:")
+        
+        logger.info("[DingTalk] 🔚 [_ON_MESSAGE END] Finished processing message ID: %s", msg_id)
 
     @staticmethod
     def _extract_text(message: "ChatbotMessage") -> str:
         """Extract plain text from a DingTalk chatbot message."""
+        # Debug: log all message attributes
+        logger.info("[DingTalk] 🔍 Message object type: %s", type(message).__name__)
+        
+        # Handle CallbackMessage with 'data' attribute
+        data = getattr(message, "data", None)
+        if data and isinstance(data, dict):
+            logger.info("[DingTalk] 🔍 Found data attribute, extracting from nested structure")
+            # Text is nested: data['text']['content']
+            text_obj = data.get("text", {})
+            if isinstance(text_obj, dict):
+                content = text_obj.get("content", "").strip()
+            else:
+                content = str(text_obj).strip()
+            
+            if not content:
+                # Fall back to rich text
+                rich_text = data.get("rich_text")
+                if rich_text and isinstance(rich_text, list):
+                    parts = [item["text"] for item in rich_text
+                             if isinstance(item, dict) and item.get("text")]
+                    content = " ".join(parts).strip()
+            
+            if not content:
+                # Try content field directly
+                content = data.get("content", "").strip()
+                
+            logger.info("[DingTalk] 🔍 Extracted from data.text.content: %s", content)
+            return content
+        
+        # Original handling for direct text attribute
         text = getattr(message, "text", None) or ""
         if isinstance(text, dict):
             content = text.get("content", "").strip()
@@ -245,6 +342,8 @@ class DingTalkAdapter(BasePlatformAdapter):
                 parts = [item["text"] for item in rich_text
                          if isinstance(item, dict) and item.get("text")]
                 content = " ".join(parts).strip()
+                        
+        logger.info("[DingTalk] 🔍 Final extracted content: %s", content[:100] if content else "(empty)")
         return content
 
     # -- Deduplication ------------------------------------------------------
@@ -273,12 +372,16 @@ class DingTalkAdapter(BasePlatformAdapter):
         """Send a markdown reply via DingTalk session webhook."""
         metadata = metadata or {}
 
+        logger.info("[DingTalk] 📤 Attempting to send message to chat: %s", chat_id[:20])
+        
         session_webhook = metadata.get("session_webhook") or self._session_webhooks.get(chat_id)
         if not session_webhook:
+            logger.error("[DingTalk] ❌ No session_webhook available for chat: %s", chat_id[:20])
             return SendResult(success=False,
                               error="No session_webhook available. Reply must follow an incoming message.")
 
         if not self._http_client:
+            logger.error("[DingTalk] ❌ HTTP client not initialized")
             return SendResult(success=False, error="HTTP client not initialized")
 
         payload = {
@@ -286,17 +389,27 @@ class DingTalkAdapter(BasePlatformAdapter):
             "markdown": {"title": "Hermes", "text": content[:self.MAX_MESSAGE_LENGTH]},
         }
 
+        logger.debug("[DingTalk] 📋 Sending payload: %s", payload)
+
         try:
+            logger.info("[DingTalk] 🌐 HTTP POST to session webhook...")
             resp = await self._http_client.post(session_webhook, json=payload, timeout=15.0)
+            logger.debug("[DingTalk] 📊 Response status: %d", resp.status_code)
+            
             if resp.status_code < 300:
-                return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
-            body = resp.text
-            logger.warning("[%s] Send failed HTTP %d: %s", self.name, resp.status_code, body[:200])
-            return SendResult(success=False, error=f"HTTP {resp.status_code}: {body[:200]}")
+                message_id = uuid.uuid4().hex[:12]
+                logger.info("[DingTalk] ✅ Message sent successfully with ID: %s", message_id)
+                return SendResult(success=True, message_id=message_id)
+            else:
+                body = resp.text
+                logger.warning("[DingTalk] ⚠️ Send failed HTTP %d: %s", resp.status_code, body[:200])
+                return SendResult(success=False, error=f"HTTP {resp.status_code}: {body[:200]}")
         except httpx.TimeoutException:
+            logger.error("[DingTalk] ⏰ Timeout sending message to DingTalk")
             return SendResult(success=False, error="Timeout sending message to DingTalk")
         except Exception as e:
-            logger.error("[%s] Send error: %s", self.name, e)
+            logger.error("[DingTalk] 💥 Send error: %s", e)
+            logger.exception("[DingTalk] Full send error trace:")
             return SendResult(success=False, error=str(e))
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
@@ -321,20 +434,44 @@ class _IncomingHandler(ChatbotHandler if DINGTALK_STREAM_AVAILABLE else object):
         self._adapter = adapter
         self._loop = loop
 
-    def process(self, message: "ChatbotMessage"):
+    async def process(self, message: "ChatbotMessage"):
         """Called by dingtalk-stream in its thread when a message arrives.
 
-        Schedules the async handler on the main event loop.
+        Must be async and return a tuple (code, message) for dingtalk_stream raw_process.
+
+        IMPORTANT: This runs on dingtalk-stream's websocket thread. We must NOT block
+        waiting for the message handler - that can take minutes as it runs the agent.
+        Instead, we fire-and-forget the message processing and return immediately.
         """
+        msg_id = getattr(message, "message_id", "unknown") or getattr(message, "text", "unknown")
+        logger.info("[DingTalk] 📥 [PROCESS START] Received message: %s", msg_id)
+        
         loop = self._loop
         if loop is None or loop.is_closed():
-            logger.error("[DingTalk] Event loop unavailable, cannot dispatch message")
+            logger.error("[DingTalk] ❌ Event loop unavailable or closed, cannot dispatch message")
             return dingtalk_stream.AckMessage.STATUS_OK, "OK"
 
-        future = asyncio.run_coroutine_threadsafe(self._adapter._on_message(message), loop)
+        logger.info("[DingTalk] 🔄 Event loop is running: %s, is_closed: %s", loop.is_running(), loop.is_closed())
+        
+        # Fire-and-forget: submit the async work to the event loop without waiting.
+        # This is critical - blocking here would hang the websocket connection.
+        # The message handler runs the agent which can take minutes, so we can't wait.
         try:
-            future.result(timeout=60)
-        except Exception:
-            logger.exception("[DingTalk] Error processing incoming message")
+            # Submit the work to the event loop and immediately return
+            # Don't wait for result! The handler will run asynchronously in the background.
+            # If we waited here and the handler took >60s, the websocket would timeout.
+            logger.info("[DingTalk] 🚀 Submitting message to event loop (fire-and-forget)...")
+            future = asyncio.run_coroutine_threadsafe(self._adapter._on_message(message), loop)
+            logger.info("[DingTalk] ✅ Message submitted successfully, future: %s", future)
+            
+            # Check if pending immediately (should be since we didn't wait)
+            logger.info("[DingTalk] 🔍 Future not done (should be True): %s", not future.done())
+            
+            # Note: NOT waiting for result - this is the key fix!
+            logger.debug("[DingTalk] Returning OK to dingtalk-stream immediately")
 
+        except Exception as e:
+            logger.exception("[DingTalk] ❌ Error dispatching incoming message: %s", e)
+
+        logger.info("[DingTalk] 👋 [PROCESS END] Returning OK, message is being handled in background")
         return dingtalk_stream.AckMessage.STATUS_OK, "OK"
